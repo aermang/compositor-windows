@@ -48,6 +48,10 @@ export function parsePsd(buffer: ArrayBuffer): PsdDocument {
       const v = new DataView(data.buffer, data.byteOffset).getUint32(0) / 65536;
       if (v > 0 && isFinite(v)) doc.resolution = v;
     }
+    if (id === 1039 && len > 0) {
+      // ICC profile: the whole resource; odd lengths carry one pad byte.
+      doc.iccProfile = data.subarray(0, len);
+    }
   }
 
   // --- Layer & Mask ---

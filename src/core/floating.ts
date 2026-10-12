@@ -6,7 +6,7 @@
 // 重做一致)。Esc 取消会移除仍在栈顶的手势条目,不留历史足迹。
 
 import { reactive } from 'vue';
-import { store, activeLayer, history, replaceLayers, wrapLayer, unwrapLayer, rawCanvas, findLayer, invalidate, uiRefresh } from './store';
+import { store, activeLayer, history, replaceLayers, wrapLayer, unwrapLayer, rawCanvas, findLayer, invalidate, uiRefresh, bumpLayerRev } from './store';
 import { prepareLayer } from './compositor';
 import { makeCanvas, ctx2d, cloneCanvas, transformQuad } from './canvasUtils';
 import { applySelectionClip, selectionBounds, isEmptySelection } from './selection';
@@ -154,6 +154,7 @@ export function beginFloatingSelection(): boolean {
   const beforeBitmap = cloneCanvas(src.bitmap);
 
   clearSelectionFromBitmap(src, sel.mask);
+  bumpLayerRev(src); // 就地清除像素且不走 rasterEdit:保持合成器按层缓存诚实
   const clearedBitmap = cloneCanvas(src.bitmap);
 
   // 漂浮图层:插在源图层上方,同父级/不透明度/混合模式
@@ -246,6 +247,7 @@ function mergeFloatingIntoSource(doc: Doc, src: Layer, flt: Layer): void {
   // 漂浮内容(文档空间)经源图层逆变换画进位图网格
   const target = src.bitmap!;
   drawDocIntoBitmapSpace(ctx2d(target), prepared, src.transform, target.width, target.height);
+  bumpLayerRev(src); // 就地合并像素且不走 rasterEdit:保持合成器按层缓存诚实
 }
 
 /** 提交漂浮:合并回源图层、移除漂浮图层、改写历史条目为最终快照。 */

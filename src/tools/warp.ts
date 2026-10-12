@@ -226,6 +226,7 @@ export class WarpStroke {
     const need = side * side * 4;
     if (this.scratch.length < need) this.scratch = new Float32Array(need);
     const sc = this.scratch;
+    sc.set(rd); // fresh per dab: the resampler reads the region just read above
 
     const dab = this.dabOut as ImageData;
     const od = dab.data;

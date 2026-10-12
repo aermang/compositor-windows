@@ -26,3 +26,6 @@ src-tauri/gen/schemas
 *.njsproj
 *.sln
 *.sw?
+
+# 测试错误截图(本地调试产物)
+test-artifacts

@@ -26,6 +26,11 @@ export function cssBlend(mode: BlendMode): GlobalCompositeOperation | null {
 
 export type Sampling = 'High quality' | 'Smooth' | 'Nearest';
 
+// Gradient tool rasterization kinds — the full Photoshop set. The value rides
+// in ToolOpts.gradient (core/store.ts); 'linear' stays the default and every
+// previously stored value remains a member, so persisted settings stay valid.
+export type GradientType = 'linear' | 'radial' | 'angle' | 'reflected' | 'diamond';
+
 export interface LayerTransform {
   origin: [number, number];   // top-left corner in document pixels
   size: [number, number];     // drawn size in document pixels
@@ -33,6 +38,20 @@ export interface LayerTransform {
   flipX: boolean;
   flipY: boolean;
   sampling: Sampling;
+}
+
+/** 逐范围样式覆盖(活字排版):[start,end) 内字符覆盖顶层同名字段;
+ *  缺省字段继承 TextMeta 顶层。索引按 content 的 Unicode 码点计。 */
+export interface TextStyleRange {
+  start: number;
+  end: number;
+  fontName?: string;
+  fontSize?: number;
+  color?: [number, number, number];
+  bold?: boolean;          // 仿粗体(权重 700)
+  italic?: boolean;        // 仿斜体
+  tracking?: number;
+  baselineShift?: number;  // px,正上负下
 }
 
 export interface TextMeta {
@@ -44,15 +63,25 @@ export interface TextMeta {
   tracking: number;       // letter spacing in px
   lineSpacing: number;    // line height in px
   boxSize: [number, number] | null; // paragraph bounds, or null for auto
+  ranges?: TextStyleRange[]; // 活字排版逐范围样式;缺省/空 = 全部继承顶层
 }
 
 export interface ShapeMeta {
-  kind: 'rectangle' | 'roundedRectangle' | 'ellipse' | 'line';
+  kind: 'rectangle' | 'roundedRectangle' | 'ellipse' | 'line' | 'polygon';
   color: [number, number, number];
   cornerRadius: number;
   lineWidth: number;
+  sides?: number; // polygon only (3–12)
   start: [number, number]; // lines, as fractions of the layer box
   end: [number, number];
+}
+
+/** Stored alpha channel (选区存储). Canvas is doc-sized, same encoding as
+ *  selection masks: white RGB with the selection coverage in alpha (255=选中). */
+export interface AlphaChannel {
+  id: string;
+  name: string;
+  canvas: HTMLCanvasElement;
 }
 
 export type AdjustmentKind =
@@ -151,6 +180,53 @@ export function defaultEffects(kind: keyof EffectsData): NonNullable<EffectsData
   }
 }
 
+// ---------- smart filters (non-destructive filter stack per layer) ----------
+// kind + params use the same vocabulary as the destructive Filter menu
+// (commands.ts applyFilterToActive): gaussianBlur / motionBlur / addNoise /
+// grain / vignette / bloom / sharpen / invert. Applied in the compositor's
+// prepareLayer, before effects, so layer styles sample the filtered pixels.
+
+export interface SmartFilter {
+  id: string;
+  kind: string;
+  params: Record<string, number | boolean>;
+  enabled: boolean;
+}
+
+// ---------- vector paths (pen tool) ----------
+// Anchors carry bezier handle offsets in document pixels; `in`/`out` null
+// means a corner anchor (straight segments on that side).
+
+export interface PathAnchor {
+  p: [number, number];
+  in: [number, number] | null;
+  out: [number, number] | null;
+}
+
+export interface PathSubpath {
+  closed: boolean;
+  anchors: PathAnchor[];
+}
+
+export interface DocPath {
+  id: string;
+  name: string;
+  subpaths: PathSubpath[];
+}
+
+// ---------- frame animation ----------
+// Each frame stores per-layer visibility/opacity overrides; layers missing
+// from `states` keep their own current values (frames created before a layer
+// existed simply don't mention it).
+
+export interface AnimFrameState { visible: boolean; opacity: number }
+
+export interface AnimFrame {
+  id: string;
+  durationMs: number;
+  states: Record<string, AnimFrameState>;
+}
+
 export interface Layer {
   id: string;
   name: string;
@@ -170,7 +246,17 @@ export interface Layer {
   text: TextMeta | null;
   shape: ShapeMeta | null;
   effects: EffectsData | null;
+  smartFilters: SmartFilter[] | null; // non-destructive filter stack, applied bottom-up
+  smartObjectId?: string; // 智能对象:引用 doc.smartObjects[].id;bitmap 为源分辨率物化视图
   expanded: boolean;      // UI-only collapse state
+  rev?: number;           // content revision: bumped on every in-place pixel edit
+}
+
+/** 智能对象的内嵌子文档(非破坏变换的像素来源)。 */
+export interface SmartObjectRef {
+  id: string;
+  name: string;
+  doc: Doc;
 }
 
 export interface Doc {
@@ -181,6 +267,13 @@ export interface Doc {
   layers: Layer[];        // bottom to top
   activeLayerId: string | null;
   fileName: string | null; // .comp path when opened from / saved to a package
+  paths?: DocPath[];      // vector paths (pen tool); absent in older docs
+  frames?: AnimFrame[];   // frame-animation timeline; absent/empty = no timeline
+  alphaChannels?: AlphaChannel[]; // stored selections; absent in older docs
+  smartObjects?: SmartObjectRef[]; // embedded smart-object sub-documents; absent in older docs
+  bitDepth?: 8 | 16;      // 来源/导出口径位深(内部合成恒 8-bit);缺省 8
+  iccProfile?: Uint8Array; // 嵌入的 ICC 配置文件原始字节(读取所得,导出回写)
+  iccName?: string;       // ICC 描述名,如 'sRGB IEC61966-2.1'、'Display P3'
 }
 
 export function defaultTransform(w: number, h: number): LayerTransform {
@@ -207,6 +300,7 @@ export function makeLayer(partial: Partial<Layer> & { name: string }): Layer {
     text: partial.text ?? null,
     shape: partial.shape ?? null,
     effects: partial.effects ?? null,
+    smartFilters: partial.smartFilters ?? null,
     expanded: partial.expanded ?? true,
   };
 }

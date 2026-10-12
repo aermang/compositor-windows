@@ -29,7 +29,7 @@ export function psdToDoc(result: PsdImportResult): Doc {
   for (const rec of result.layers) {
     layers.push(recordToLayer(rec, result, layers));
   }
-  return {
+  const doc: Doc = {
     id: crypto.randomUUID().toUpperCase(),
     width: result.width,
     height: result.height,
@@ -38,6 +38,12 @@ export function psdToDoc(result: PsdImportResult): Doc {
     activeLayerId: layers.length ? layers[layers.length - 1].id : null,
     fileName: null,
   };
+  // Image Resources ID 1039 提取到的 ICC 配置文件(reader → builder 已解析出描述名)
+  if (result.iccProfile?.length) {
+    doc.iccProfile = result.iccProfile;
+    doc.iccName = result.iccName;
+  }
+  return doc;
 }
 
 /** 导入说明:读者注释 + 转换期告警(蒙版对齐、被跳过的调整图层),已去重。 */

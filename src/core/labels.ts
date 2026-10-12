@@ -60,4 +60,8 @@ export const TOOL_ZH: Record<ToolId, string> = {
   eyedropper: '吸管',
   hand: '抓手',
   zoom: '缩放',
+  pen: '钢笔',
+  heal: '修复画笔',
+  dodge: '减淡',
+  patch: '修补', camove: '感知移动',
 };

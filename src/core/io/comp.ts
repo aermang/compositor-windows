@@ -4,13 +4,15 @@
 // reader never sees a partial project.
 
 import { makeCanvas, ctx2dRead } from '../canvasUtils';
-import { readTextFile, writeFile, writeFileAtomic, makeDir, pathExists, listDir, removeFile } from './fs';
+import { readTextFile, readFile, writeFile, writeFileAtomic, makeDir, pathExists, listDir, removeFile } from './fs';
 import { canvasToBlob, openImageFile } from './raster';
 import {
   makeLayer, defaultAdjustment, BLEND_MODES,
 } from '../types';
 import type {
-  AdjustmentData, AdjustmentKind, BlendMode, Doc, LayerTransform, EffectsData, TextMeta,
+  AdjustmentData, AdjustmentKind, BlendMode, Doc, Layer, LayerTransform, EffectsData, TextMeta,
+  TextStyleRange,
+  SmartFilter, DocPath, AnimFrame, AlphaChannel,
 } from '../types';
 
 const FORMAT = 'com.compositor.project';
@@ -30,12 +32,19 @@ interface RawLayer {
   maskPlacement?: RawTransform | null; maskLinked?: boolean | null;
   shape?: Record<string, unknown> | null; effects?: Record<string, unknown> | null;
   text?: Record<string, unknown> | null;
+  smartFilters?: SmartFilter[];
+  smartObjectId?: string;
 }
 
 interface RawManifest {
   format: string; version: number; colorSpace: string; documentID: string;
   width: number; height: number; resolution?: number;
   activeLayerID?: string | null; layers: RawLayer[];
+  paths?: DocPath[]; frames?: AnimFrame[];
+  alphaChannels?: { id: string; name: string; file: string }[];
+  smartObjects?: { id: string; name: string; width: number; height: number; layers: RawLayer[] }[];
+  bitDepth?: number;      // 导出口径位深(内部合成恒 8bit);缺省 = 8
+  iccName?: string;       // images/doc.icc 存在时的描述名(兼作存在标志)
 }
 
 function toTransform(rt: RawTransform): LayerTransform {
@@ -71,44 +80,114 @@ export async function openComp(path: string): Promise<Doc> {
   };
 
   for (const rl of raw.layers) {
-    const layer = makeLayer({ name: rl.name, id: rl.id.toUpperCase() });
-    layer.isVisible = rl.isVisible ?? true;
-    layer.transform = toTransform(rl.transform);
-    layer.parentId = rl.parentID?.toUpperCase() ?? null;
-    layer.isGroup = rl.isGroup ?? false;
-    layer.opacity = typeof rl.opacity === 'number' ? rl.opacity : 1;
-    const blend = rl.blendMode ?? 'Normal';
-    layer.blendMode = (BLEND_MODES as readonly string[]).includes(blend) ? blend as BlendMode : 'Normal';
-    layer.maskSourceId = rl.maskSourceID?.toUpperCase() ?? null;
-    layer.maskLinked = rl.maskLinked ?? true;
-    layer.maskEnabled = rl.maskEnabled ?? true;
-    if (rl.maskPlacement) layer.maskPlacement = toTransform(rl.maskPlacement);
-
-    if (rl.imageFile) {
-      layer.bitmap = await openImageFile(`${imagesDir}/${rl.imageFile}`);
-    }
-    if (rl.maskFile) {
-      layer.mask = await openImageFile(`${imagesDir}/${rl.maskFile}`);
-    }
-    if (rl.adjustment) layer.adjustment = parseAdjustment(rl.adjustment);
-    if (rl.text) layer.text = parseText(rl.text);
-    if (rl.effects) layer.effects = parseEffects(rl.effects);
-    if (rl.shape) {
-      layer.shape = {
-        kind: (rl.shape.kind as 'rectangle') ?? 'rectangle',
-        color: [Number(rl.shape.red) || 0, Number(rl.shape.green) || 0, Number(rl.shape.blue) || 0],
-        cornerRadius: Number(rl.shape.cornerRadius) || 0,
-        lineWidth: Number(rl.shape.lineWidth) || 0,
-        start: Array.isArray(rl.shape.start) ? rl.shape.start as [number, number] : [0, 0.5],
-        end: Array.isArray(rl.shape.end) ? rl.shape.end as [number, number] : [1, 0.5],
-      };
-    }
-    doc.layers.push(layer);
+    doc.layers.push(await rawLayerToLayer(rl, imagesDir));
   }
   if (!doc.activeLayerId && doc.layers.length) {
     doc.activeLayerId = doc.layers[doc.layers.length - 1].id;
   }
+  // 顶层 paths/frames 是本版本新增字段:旧 manifest 没有就落到空数组(纯 JSON
+  // 结构,面板全部用可选链读取)。逐项做最浅结构校验,防手改文件炸面板。
+  doc.paths = Array.isArray(raw.paths)
+    ? raw.paths.filter(p => !!p && typeof p.id === 'string' && Array.isArray(p.subpaths))
+    : [];
+  doc.frames = Array.isArray(raw.frames)
+    ? raw.frames.filter(f => !!f && typeof f.id === 'string'
+      && typeof f.durationMs === 'number' && !!f.states && typeof f.states === 'object')
+    : [];
+  // alpha 通道:PNG 本体在 images/,manifest 只存 id/名称/文件名。单个文件缺失
+  // (手删/损坏)只跳过该通道,不让整个工程打不开。
+  doc.alphaChannels = [];
+  if (Array.isArray(raw.alphaChannels)) {
+    for (const ra of raw.alphaChannels) {
+      if (!ra || typeof ra.id !== 'string' || typeof ra.file !== 'string') continue;
+      try {
+        const canvas: HTMLCanvasElement = await openImageFile(`${imagesDir}/${ra.file}`);
+        doc.alphaChannels.push({
+          id: ra.id, name: typeof ra.name === 'string' && ra.name ? ra.name : 'Alpha', canvas,
+        });
+      } catch { /* 缺图跳过 */ }
+    }
+  }
+  // 智能对象子文档:manifest 内联嵌套层结构,位图以 so<refId>- 前缀共享 images/。
+  // 单个子文档损坏只跳过该项,不影响主文档打开。
+  doc.smartObjects = [];
+  if (Array.isArray(raw.smartObjects)) {
+    for (const rs of raw.smartObjects) {
+      if (!rs || typeof rs.id !== 'string' || !Array.isArray(rs.layers)) continue;
+      try {
+        const subDoc: Doc = {
+          id: crypto.randomUUID(),
+          width: Number(rs.width) || 1, height: Number(rs.height) || 1,
+          resolution: raw.resolution ?? 72,
+          layers: [], activeLayerId: null, fileName: null,
+        };
+        for (const rsl of rs.layers) {
+          if (rsl && typeof rsl.id === 'string' && typeof rsl.name === 'string') {
+            subDoc.layers.push(await rawLayerToLayer(rsl, imagesDir));
+          }
+        }
+        if (!subDoc.layers.length) continue;
+        subDoc.activeLayerId = subDoc.layers[subDoc.layers.length - 1].id;
+        doc.smartObjects.push({
+          id: rs.id, name: typeof rs.name === 'string' && rs.name ? rs.name : '智能对象', doc: subDoc,
+        });
+      } catch { /* 子文档损坏跳过 */ }
+    }
+  }
+  // 位深/ICC:manifest 记口径标志与描述名,ICC 原始字节在 images/doc.icc。
+  // 旧工程两字段都没有 → 保持 8bit 无 ICC;doc.icc 被手删只丢 ICC,不影响打开。
+  if (raw.bitDepth === 16) doc.bitDepth = 16;
+  if (raw.iccName) {
+    try {
+      doc.iccProfile = await readFile(`${imagesDir}/doc.icc`);
+      doc.iccName = raw.iccName;
+    } catch { /* 缺文件跳过 */ }
+  }
   return doc;
+}
+
+/** RawLayer → Layer(主文档与智能对象子文档共用)。 */
+async function rawLayerToLayer(rl: RawLayer, imagesDir: string): Promise<Layer> {
+  const layer = makeLayer({ name: rl.name, id: rl.id.toUpperCase() });
+  layer.isVisible = rl.isVisible ?? true;
+  layer.transform = toTransform(rl.transform);
+  layer.parentId = rl.parentID?.toUpperCase() ?? null;
+  layer.isGroup = rl.isGroup ?? false;
+  layer.opacity = typeof rl.opacity === 'number' ? rl.opacity : 1;
+  const blend = rl.blendMode ?? 'Normal';
+  layer.blendMode = (BLEND_MODES as readonly string[]).includes(blend) ? blend as BlendMode : 'Normal';
+  layer.maskSourceId = rl.maskSourceID?.toUpperCase() ?? null;
+  layer.maskLinked = rl.maskLinked ?? true;
+  layer.maskEnabled = rl.maskEnabled ?? true;
+  if (rl.maskPlacement) layer.maskPlacement = toTransform(rl.maskPlacement);
+
+  if (rl.imageFile) {
+    layer.bitmap = await openImageFile(`${imagesDir}/${rl.imageFile}`);
+  }
+  if (rl.maskFile) {
+    layer.mask = await openImageFile(`${imagesDir}/${rl.maskFile}`);
+  }
+  if (rl.adjustment) layer.adjustment = parseAdjustment(rl.adjustment);
+  if (rl.text) layer.text = parseText(rl.text);
+  if (rl.effects) layer.effects = parseEffects(rl.effects);
+  if (rl.smartFilters?.length) {
+    const filters = rl.smartFilters.map(parseSmartFilter).filter((f): f is SmartFilter => !!f);
+    if (filters.length) layer.smartFilters = filters;
+  }
+  if (rl.smartObjectId) layer.smartObjectId = rl.smartObjectId;
+  if (rl.shape) {
+    const sides = Number(rl.shape.sides);
+    layer.shape = {
+      kind: (rl.shape.kind as 'rectangle') ?? 'rectangle',
+      color: [Number(rl.shape.red) || 0, Number(rl.shape.green) || 0, Number(rl.shape.blue) || 0],
+      cornerRadius: Number(rl.shape.cornerRadius) || 0,
+      lineWidth: Number(rl.shape.lineWidth) || 0,
+      start: Array.isArray(rl.shape.start) ? rl.shape.start as [number, number] : [0, 0.5],
+      end: Array.isArray(rl.shape.end) ? rl.shape.end as [number, number] : [1, 0.5],
+      ...(Number.isFinite(sides) && sides >= 3 ? { sides } : {}),
+    };
+  }
+  return layer;
 }
 
 function parseAdjustment(ra: Record<string, unknown>): AdjustmentData {
@@ -189,7 +268,20 @@ function parseText(rt: Record<string, unknown>): TextMeta {
     tracking: num(rt.tracking),
     lineSpacing: leading > 0 ? leading : fontSize * 1.2,
     boxSize: box?.width && box?.height ? [box.width, box.height] : null,
+    ranges: parseTextRanges(rt.ranges),
   };
+}
+
+/** 逐范围样式:最浅结构校验(防手改文件炸渲染),坏项跳过。 */
+function parseTextRanges(v: unknown): TextStyleRange[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out: TextStyleRange[] = [];
+  for (const r of v) {
+    const rr = r as Record<string, unknown>;
+    if (!rr || typeof rr.start !== 'number' || typeof rr.end !== 'number') continue;
+    out.push({ ...rr, start: rr.start, end: rr.end } as TextStyleRange);
+  }
+  return out.length ? out : undefined;
 }
 
 function parseEffects(re: Record<string, unknown>): EffectsData {
@@ -230,6 +322,20 @@ function num(v: unknown, fallback = 0): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
 }
 
+/** 智能滤镜逐条校验:未知 kind 留给合成器透传(前向兼容),只挡结构坏项。 */
+function parseSmartFilter(v: unknown): SmartFilter | null {
+  if (!v || typeof v !== 'object') return null;
+  const o = v as Record<string, unknown>;
+  if (typeof o.id !== 'string' || typeof o.kind !== 'string' || !o.params || typeof o.params !== 'object') {
+    return null;
+  }
+  const params: Record<string, number | boolean> = {};
+  for (const [k, val] of Object.entries(o.params as Record<string, unknown>)) {
+    if (typeof val === 'number' || typeof val === 'boolean') params[k] = val;
+  }
+  return { id: o.id, kind: o.kind, params, enabled: o.enabled !== false };
+}
+
 // ---------- saving ----------
 
 export async function saveComp(doc: Doc, path: string): Promise<void> {
@@ -239,53 +345,39 @@ export async function saveComp(doc: Doc, path: string): Promise<void> {
 
   const records: RawLayer[] = [];
   for (const layer of doc.layers) {
-    const rec: RawLayer = {
-      id: layer.id,
-      name: layer.name,
-      isVisible: layer.isVisible,
-      transform: {
-        origin: layer.transform.origin, size: layer.transform.size,
-        rotation: layer.transform.rotation, flipX: layer.transform.flipX, flipY: layer.transform.flipY,
-        sampling: layer.transform.sampling,
-      },
-      imageFile: null,
-    };
-    if (layer.isGroup) rec.isGroup = true;
-    if (layer.parentId) rec.parentID = layer.parentId;
-    if (layer.opacity !== 1) rec.opacity = layer.opacity;
-    if (layer.blendMode !== 'Normal') rec.blendMode = layer.blendMode;
-    if (layer.maskSourceId) rec.maskSourceID = layer.maskSourceId;
-    if (layer.mask && !layer.maskLinked && layer.maskPlacement) {
-      rec.maskPlacement = {
-        origin: layer.maskPlacement.origin, size: layer.maskPlacement.size,
-        rotation: layer.maskPlacement.rotation, flipX: layer.maskPlacement.flipX, flipY: layer.maskPlacement.flipY,
-      };
-      rec.maskLinked = false;
-    }
-    if (layer.bitmap) {
-      const file = `${layer.id}.png`;
-      await writeCanvasPng(layer.bitmap, `${imagesDir}/${file}`);
-      rec.imageFile = file;
-    }
-    if (layer.mask) {
-      const file = `${layer.id}.mask.png`;
-      await writeMaskPng(layer.mask, `${imagesDir}/${file}`);
-      rec.maskFile = file;
-      rec.maskEnabled = layer.maskEnabled;
-    }
-    if (layer.adjustment) rec.adjustment = buildAdjustment(layer.adjustment);
-    if (layer.text) rec.text = buildText(layer.text);
-    if (layer.effects) rec.effects = buildEffects(layer.effects);
-    if (layer.shape) rec.shape = {
-      kind: layer.shape.kind, red: layer.shape.color[0], green: layer.shape.color[1], blue: layer.shape.color[2],
-      cornerRadius: layer.shape.cornerRadius, lineWidth: layer.shape.lineWidth,
-      start: layer.shape.start, end: layer.shape.end,
-    } as unknown as Record<string, unknown>;
-    records.push(rec);
+    records.push(await layerToRaw(layer, imagesDir));
+  }
+
+  // 智能对象子文档:位图带 so<refId>- 前缀写同一 images/,manifest 内联嵌套层
+  const smartRecs: { id: string; name: string; width: number; height: number; layers: RawLayer[] }[] = [];
+  for (const ref of doc.smartObjects ?? []) {
+    const subLayers: RawLayer[] = [];
+    for (const sl of ref.doc.layers) subLayers.push(await layerToRaw(sl, imagesDir, `so${ref.id}-`));
+    smartRecs.push({ id: ref.id, name: ref.name, width: ref.doc.width, height: ref.doc.height, layers: subLayers });
+  }
+
+  // alpha 通道画布存为独立 PNG(alpha 分量即选区覆盖度,载入时 drawImage 直取)
+  const alphaFiles: (AlphaChannel & { file: string })[] = [];
+  for (const ch of doc.alphaChannels ?? []) {
+    const file = `${ch.id}.alpha.png`;
+    await writeCanvasPng(ch.canvas, `${imagesDir}/${file}`);
+    alphaFiles.push({ id: ch.id, name: ch.name, canvas: ch.canvas, file });
+  }
+
+  // ICC 配置文件:原始 bin 存 images/doc.icc(manifest 记 iccName 兼作存在标志)
+  let hasIcc = false;
+  if (doc.iccProfile?.length) {
+    await writeFile(`${imagesDir}/doc.icc`, doc.iccProfile);
+    hasIcc = true;
   }
 
   // prune images no longer referenced
-  const keep = new Set(records.flatMap(r => [r.imageFile, r.maskFile].filter(Boolean) as string[]));
+  const keep = new Set([
+    ...records.flatMap(r => [r.imageFile, r.maskFile].filter(Boolean) as string[]),
+    ...alphaFiles.map(a => a.file),
+    ...smartRecs.flatMap(s => s.layers.flatMap(l => [l.imageFile, l.maskFile].filter(Boolean) as string[])),
+  ]);
+  if (hasIcc) keep.add('doc.icc'); // ICC 撤掉后旧 doc.icc 由 prune 正常回收
   for (const name of await listDir(imagesDir)) {
     if (!keep.has(name)) {
       await removeFile(`${imagesDir}/${name.replace(/\\/g, '/')}`).catch(() => {});
@@ -304,6 +396,16 @@ export async function saveComp(doc: Doc, path: string): Promise<void> {
     layers: records,
     guides: [],
   };
+  // 路径/帧/alpha 通道只在非空时写入(可选字段,旧版本与旧文件双向兼容)
+  if (doc.paths?.length) manifest.paths = doc.paths;
+  if (doc.frames?.length) manifest.frames = doc.frames;
+  if (alphaFiles.length) {
+    manifest.alphaChannels = alphaFiles.map(a => ({ id: a.id, name: a.name, file: a.file }));
+  }
+  if (smartRecs.length) manifest.smartObjects = smartRecs;
+  // 位深/ICC 只在非默认时写入(旧版本打开新工程:未知字段被忽略,双向兼容)
+  if (doc.bitDepth === 16) manifest.bitDepth = 16;
+  if (hasIcc) manifest.iccName = doc.iccName ?? 'ICC Profile';
   const json = JSON.stringify(manifest, null, 2);
   await writeFileAtomic(`${pkg}/manifest.json`, new TextEncoder().encode(json));
 }
@@ -357,6 +459,7 @@ function buildText(t: TextMeta): Record<string, unknown> {
     red: t.color[0], green: t.color[1], blue: t.color[2],
     alignment: align, tracking: t.tracking, leading: Math.round(t.lineSpacing),
     boxSize: t.boxSize ? { width: t.boxSize[0], height: t.boxSize[1] } : null,
+    ...(t.ranges?.length ? { ranges: t.ranges } : {}),
   };
 }
 
@@ -386,6 +489,61 @@ function buildEffects(fx: EffectsData): Record<string, unknown> {
     opacity: fx.innerGlow.opacity,
   };
   return out;
+}
+
+/** Layer → RawLayer(主文档与智能对象子文档共用;prefix 区分子文档位图文件名)。 */
+async function layerToRaw(layer: Layer, imagesDir: string, prefix = ''): Promise<RawLayer> {
+  const rec: RawLayer = {
+    id: layer.id,
+    name: layer.name,
+    isVisible: layer.isVisible,
+    transform: {
+      origin: layer.transform.origin, size: layer.transform.size,
+      rotation: layer.transform.rotation, flipX: layer.transform.flipX, flipY: layer.transform.flipY,
+      sampling: layer.transform.sampling,
+    },
+    imageFile: null,
+  };
+  if (layer.isGroup) rec.isGroup = true;
+  if (layer.parentId) rec.parentID = layer.parentId;
+  if (layer.opacity !== 1) rec.opacity = layer.opacity;
+  if (layer.blendMode !== 'Normal') rec.blendMode = layer.blendMode;
+  if (layer.maskSourceId) rec.maskSourceID = layer.maskSourceId;
+  if (layer.mask && !layer.maskLinked && layer.maskPlacement) {
+    rec.maskPlacement = {
+      origin: layer.maskPlacement.origin, size: layer.maskPlacement.size,
+      rotation: layer.maskPlacement.rotation, flipX: layer.maskPlacement.flipX, flipY: layer.maskPlacement.flipY,
+    };
+    rec.maskLinked = false;
+  }
+  if (layer.bitmap) {
+    const file = `${prefix}${layer.id}.png`;
+    await writeCanvasPng(layer.bitmap, `${imagesDir}/${file}`);
+    rec.imageFile = file;
+  }
+  if (layer.mask) {
+    const file = `${prefix}${layer.id}.mask.png`;
+    await writeMaskPng(layer.mask, `${imagesDir}/${file}`);
+    rec.maskFile = file;
+    rec.maskEnabled = layer.maskEnabled;
+  }
+  if (layer.adjustment) rec.adjustment = buildAdjustment(layer.adjustment);
+  if (layer.text) rec.text = buildText(layer.text);
+  if (layer.effects) rec.effects = buildEffects(layer.effects);
+  // 智能滤镜纯 JSON,浅拷贝脱掉 reactive 代理再进 manifest
+  if (layer.smartFilters?.length) {
+    rec.smartFilters = layer.smartFilters.map(f => ({
+      id: f.id, kind: f.kind, params: { ...f.params }, enabled: f.enabled,
+    }));
+  }
+  if (layer.smartObjectId) rec.smartObjectId = layer.smartObjectId;
+  if (layer.shape) rec.shape = {
+    kind: layer.shape.kind, red: layer.shape.color[0], green: layer.shape.color[1], blue: layer.shape.color[2],
+    cornerRadius: layer.shape.cornerRadius, lineWidth: layer.shape.lineWidth,
+    sides: layer.shape.sides,
+    start: layer.shape.start, end: layer.shape.end,
+  } as unknown as Record<string, unknown>;
+  return rec;
 }
 
 async function writeCanvasPng(c: HTMLCanvasElement, path: string) {

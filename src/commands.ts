@@ -14,7 +14,7 @@ import { makeCanvas, ctx2d, ctx2dRead, cloneCanvas } from './core/canvasUtils';
 import { invertSelection, emptySelection, finalize, isEmptySelection } from './core/selection';
 import { prepareLayer } from './core/compositor';
 import { invertApply, addNoiseApply, grainApply, motionBlurApply } from './core/pixels/adjust';
-import { openImageFile, exportCanvas } from './core/io/raster';
+import { openImageFile, openImageWithMeta, exportCanvas } from './core/io/raster';
 import { openComp, saveComp } from './core/io/comp';
 import { basename } from './core/recent';
 import { copySelection, cutSelection, copyMerged, pasteClip, layerViaCopy, hasPixelClip } from './core/clipboard';
@@ -23,8 +23,20 @@ import { workspace, ensureTab, closeTab, tabDidSave, tabDidLoad } from './core/w
 import { rotateCanvas90 } from './core/rotateCanvas';
 import { uiFlags } from './core/uiFlags';
 import { guides } from './core/guides';
-import { readFile } from './core/io/fs';
+import { readFile, writeFile } from './core/io/fs';
+import { exportPsd } from './core/io/psdExport';
+import { exportApngCommand } from './core/io/apngExport';
+import { exportGifCommand } from './core/io/gifExport';
+import { importTiff, exportTiffCommand } from './core/io/tiff';
+import { storeSelectionAsChannel } from './core/channels';
+import { autoTone, autoContrast, autoColor } from './core/pixels/autoAdjust';
+import {
+  vibranceApply, channelMixerApply, photoFilterApply, shadowHighlightApply,
+} from './core/pixels/creativeAdjust';
+import { toggleQuickMask } from './core/quickMask';
 import { isRawPath, rawMetadata, developRaw } from './core/io/raw';
+import { convertToSmartObject, rasterizeSmartObject } from './core/smartObject';
+import { recordStep } from './core/actions';
 import { isPsd } from './core/io/psd/builder';
 import { ADJUSTMENT_ZH } from './core/labels';
 import { applyCrop } from './tools/crop';
@@ -52,10 +64,15 @@ cmd({ id: 'file.openImage', label: '打开图像…', menu: 'File', shortcut: 'C
 cmd({ id: 'file.openComp', label: '打开 Compositor 项目…', menu: 'File', run: openProject });
 cmd({ id: 'file.recents', label: '最近打开…', menu: 'File', run: () => { store.dialog = 'recents'; } });
 cmd({ id: 'file.importLayer', label: '导入图像为图层…', menu: 'File', sep: true, enabled: hasDoc, run: importAsLayer });
+cmd({ id: 'file.importPdf', label: '导入 PDF…', menu: 'File', run: importPdfPick });
 cmd({ id: 'file.save', label: '保存项目', menu: 'File', shortcut: 'Ctrl+S', sep: true, enabled: hasDoc, run: saveProject });
 cmd({ id: 'file.saveAs', label: '项目另存为…', menu: 'File', shortcut: 'Ctrl+Shift+S', enabled: hasDoc, run: () => saveProject(true) });
 cmd({ id: 'file.exportPng', label: '导出 PNG', menu: 'File', shortcut: 'Ctrl+Shift+E', sep: true, enabled: hasDoc, run: () => exportFlat('png') });
 cmd({ id: 'file.exportJpeg', label: '导出 JPEG…', menu: 'File', shortcut: 'Ctrl+Alt+S', enabled: hasDoc, run: () => exportFlat('jpeg') });
+cmd({ id: 'file.exportPsd', label: '导出 PSD…', menu: 'File', enabled: hasDoc, run: exportPsdFlat });
+cmd({ id: 'file.exportApng', label: '导出 APNG 动画…', menu: 'File', enabled: hasDoc, run: exportApngCommand });
+cmd({ id: 'file.exportGif', label: '导出 GIF 动画…', menu: 'File', enabled: hasDoc, run: exportGifCommand });
+cmd({ id: 'file.exportTiff', label: '导出 TIFF…', menu: 'File', enabled: hasDoc, run: exportTiffCommand });
 cmd({ id: 'file.exportAs', label: '导出为…', menu: 'File', shortcut: 'Ctrl+Alt+W', enabled: hasDoc, run: () => { store.dialog = 'export'; } });
 cmd({
   id: 'file.close', label: '关闭文档', menu: 'File', shortcut: 'Ctrl+W', sep: true,
@@ -137,6 +154,10 @@ cmd({
   run: () => { store.dialog = 'contentFill'; },
 });
 cmd({
+  id: 'edit.puppet', label: '操控变形…', menu: 'Edit', enabled: hasLayer,
+  run: () => { store.dialog = 'puppet'; },
+});
+cmd({
   id: 'edit.freeTransform', label: '自由变换', menu: 'Edit', shortcut: 'Ctrl+T', sep: true,
   run: () => {
     // with a live selection Ctrl+T floats it (commit on Esc/Enter/tool-switch);
@@ -149,8 +170,21 @@ cmd({ id: 'edit.shortcuts', label: '键盘快捷键', menu: 'Edit', sep: true, r
 
 // ---------- Image ----------
 
-cmd({ id: 'image.imageSize', label: '图像大小…', menu: 'Image', shortcut: 'Ctrl+Alt+I', enabled: hasDoc, run: () => { store.dialog = 'imageSize'; } });
+cmd({
+  id: 'image.autoTone', label: '自动色调', menu: 'Image', shortcut: 'Ctrl+Shift+L',
+  enabled: hasLayer, run: () => { autoTone(activeLayer.value!); },
+});
+cmd({
+  id: 'image.autoContrast', label: '自动对比度', menu: 'Image', shortcut: 'Ctrl+Alt+Shift+L',
+  enabled: hasLayer, run: () => { autoContrast(activeLayer.value!); },
+});
+cmd({
+  id: 'image.autoColor', label: '自动颜色', menu: 'Image', shortcut: 'Ctrl+Shift+B',
+  enabled: hasLayer, run: () => { autoColor(activeLayer.value!); },
+});
+cmd({ id: 'image.imageSize', label: '图像大小…', menu: 'Image', shortcut: 'Ctrl+Alt+I', sep: true, enabled: hasDoc, run: () => { store.dialog = 'imageSize'; } });
 cmd({ id: 'image.canvasSize', label: '画布大小…', menu: 'Image', shortcut: 'Ctrl+Alt+C', enabled: hasDoc, run: () => { store.dialog = 'canvasSize'; } });
+cmd({ id: 'image.info', label: '图像信息…', menu: 'Image', enabled: hasDoc, run: () => { store.dialog = 'imageInfo'; } });
 cmd({
   id: 'image.cropToSelection', label: '裁剪到选区', menu: 'Image', enabled: () => hasDoc() && !!store.selection?.bounds,
   run: () => {
@@ -193,6 +227,11 @@ cmd({ id: 'image.rotate90ccw', label: '旋转画布 90°（逆时针）', menu: 
 
 cmd({ id: 'layer.new', label: '新建图层', menu: 'Layer', shortcut: 'Ctrl+Shift+N', enabled: hasDoc, run: () => { addRasterLayer(); } });
 cmd({ id: 'layer.newGroup', label: '新建组', menu: 'Layer', enabled: hasDoc, run: () => { addGroupLayer(); } });
+cmd({ id: 'layer.toSmart', label: '转换为智能对象', menu: 'Layer', enabled: hasLayer, run: () => { convertToSmartObject(); } });
+cmd({
+  id: 'layer.rasterizeSmart', label: '栅格化智能对象', menu: 'Layer',
+  enabled: () => !!activeLayer.value?.smartObjectId, run: () => { rasterizeSmartObject(); },
+});
 cmd({
   // Ctrl+J: via-copy honors an active selection (选区内像素建新图层), else duplicates the layer
   id: 'layer.duplicate', label: '复制图层', menu: 'Layer', shortcut: 'Ctrl+J', sep: true, enabled: hasLayer,
@@ -301,6 +340,11 @@ cmd({
   run: () => { store.selection = null; },
 });
 cmd({
+  id: 'select.quickMask', label: '切换快速蒙版', menu: 'Select', shortcut: 'Q', sep: true,
+  enabled: hasDoc,
+  run: () => { toggleQuickMask(); },
+});
+cmd({
   id: 'select.inverse', label: '反选', menu: 'Select', shortcut: 'Ctrl+Shift+I', enabled: () => !!store.selection,
   run: () => { if (store.selection) invertSelection(store.selection); },
 });
@@ -336,6 +380,10 @@ cmd({
   id: 'select.removeBackground', label: '移除背景', menu: 'Select', enabled: hasDoc,
   run: () => { store.dialogPayload = { mode: 'removeBg' }; store.dialog = 'subject'; },
 });
+cmd({
+  id: 'select.storeChannel', label: '存储选区', menu: 'Select', sep: true,
+  enabled: () => !!store.selection, run: () => { storeSelectionAsChannel(); },
+});
 
 // ---------- Filter (destructive on the active layer) ----------
 
@@ -347,6 +395,16 @@ for (const f of [
   { id: 'vignette', label: '暗角…', def: { amount: 50 } },
   { id: 'bloom', label: '泛光…', def: { amount: 40, radius: 12 } },
   { id: 'sharpen', label: '锐化', def: { amount: 50 } },
+  { id: 'vibrance', label: '自然饱和度…', def: { vibrance: 50, saturation: 0 } },
+  {
+    id: 'channelMixer', label: '通道混合器…', def: {
+      redFromRed: 100, redFromGreen: 0, redFromBlue: 0,
+      greenFromRed: 0, greenFromGreen: 100, greenFromBlue: 0,
+      blueFromRed: 0, blueFromGreen: 0, blueFromBlue: 100,
+    },
+  },
+  { id: 'photoFilter', label: '照片滤镜…', def: { warmth: 40, density: 25 } },
+  { id: 'shadowHighlight', label: '阴影/高光…', def: { shadows: 30, highlights: 20 } },
 ]) {
   cmd({
     id: `filter.${f.id}`, label: f.label, menu: 'Filter', enabled: hasLayer,
@@ -367,6 +425,7 @@ cmd({
 });
 cmd({ id: 'filter.dither', label: '抖动…', menu: 'Filter', enabled: () => !!activeLayer.value?.bitmap, run: () => { store.dialog = 'dither'; } });
 cmd({ id: 'filter.scanlines', label: '扫描线…', menu: 'Filter', enabled: () => !!activeLayer.value?.bitmap, run: () => { store.dialog = 'scanlines'; } });
+cmd({ id: 'filter.liquify', label: '液化…', menu: 'Filter', enabled: hasLayer, run: () => { store.dialog = 'liquify'; } });
 
 // ---------- View ----------
 
@@ -458,7 +517,7 @@ async function pickSave(defaultName: string): Promise<string | null> {
 }
 
 const OPEN_IMAGE_EXTS = [
-  'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg',
+  'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'tif', 'tiff', 'pdf',
   'psd', 'psb', 'cr2', 'cr3', 'nef', 'arw', 'dng', 'raf', 'orf', 'rw2', 'pef', 'srw',
 ];
 const PLAIN_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg']);
@@ -479,6 +538,20 @@ export async function openPathByKind(path: string): Promise<void> {
     } catch (err) {
       alert(`无法打开项目：${(err as Error).message}`);
     }
+    return;
+  }
+  if (/\.(tif|tiff)$/i.test(path)) {
+    try {
+      const doc = await importTiff(path);
+      setDoc(doc);
+      tabDidLoad(path, basename(path));
+    } catch (err) {
+      alert(`无法打开 TIFF：${(err as Error).message}`);
+    }
+    return;
+  }
+  if (/\.pdf$/i.test(path)) {
+    await importPdfOpen(path);
     return;
   }
   if (isRawPath(path)) {
@@ -506,16 +579,36 @@ export async function openPathByKind(path: string): Promise<void> {
     }
   }
   try {
-    const canvas = await openImageFile(path);
+    const { canvas, icc, iccName } = await openImageWithMeta(path);
     const name = path.split(/[\\/]/).pop()!.replace(/\.[^.]+$/, '');
     newDoc(canvas.width, canvas.height, 'transparent', name);
     const doc = store.doc!;
     doc.layers[0].bitmap = rawCanvas(canvas);
     doc.layers[0].name = name;
+    // PNG iCCP / JPEG APP2 提取所得;随 .comp 与导出回写(Preserve 口径)
+    if (icc) { doc.iccProfile = icc; doc.iccName = iccName; }
     store.tick++;
     tabDidLoad(path, name);
   } catch (err) {
     alert(`无法打开图像：${(err as Error).message}`);
+  }
+}
+
+async function importPdfPick() {
+  const path = await pickFile(['pdf']);
+  if (!path) return;
+  await importPdfOpen(path);
+}
+
+/** PDF → 新文档,每页一个图层(多页全导;页数上限在 pdfImport 内)。 */
+async function importPdfOpen(path: string) {
+  try {
+    const { importPdf } = await import('./core/io/pdfImport');
+    const doc = await importPdf(path, true);
+    setDoc(doc);
+    tabDidLoad(path, basename(path));
+  } catch (err) {
+    alert(`无法打开 PDF：${(err as Error).message}`);
   }
 }
 
@@ -602,6 +695,19 @@ async function exportFlat(format: 'png' | 'jpeg') {
   if (path) await exportCanvas(flat, withExtension(path, 'png'), 'png');
 }
 
+/** 导出 PSD(含图层):二进制 ArrayBuffer 经 write_file 写盘,与 exportCanvas 同一写文件通道。 */
+async function exportPsdFlat() {
+  const doc = store.doc;
+  if (!doc) return;
+  const path = await pickSave('Untitled.psd');
+  if (!path) return;
+  try {
+    await writeFile(withExtension(path, 'psd'), new Uint8Array(exportPsd(doc)));
+  } catch (err) {
+    alert(`无法导出 PSD：${(err as Error).message}`);
+  }
+}
+
 // ---------- filters ----------
 
 export interface LastFilter { kind: string; params: Record<string, number | boolean> }
@@ -634,6 +740,10 @@ export function applyFilterToActive(kind: string, params: Record<string, number 
         break;
       case 'grain': grainApply(sub.data, w, Number(params.amount), 7); break;
       case 'motionBlur': motionBlurApply(sub.data, w, h, Number(params.angle), Number(params.distance)); break;
+      case 'vibrance': vibranceApply(sub.data, w, Number(params.vibrance), Number(params.saturation)); break;
+      case 'channelMixer': channelMixerApply(sub.data, params); break;
+      case 'photoFilter': photoFilterApply(sub.data, Number(params.warmth), Number(params.density)); break;
+      case 'shadowHighlight': shadowHighlightApply(sub.data, w, h, Number(params.shadows), Number(params.highlights)); break;
     }
     bx.putImageData(sub, x, y);
   });
@@ -705,12 +815,15 @@ export function commandById(id: string): Command | undefined {
 
 export function runCommand(id: string) {
   const c = commandById(id);
-  if (c && (!c.enabled || c.enabled())) void c.run();
+  if (c && (!c.enabled || c.enabled())) {
+    recordStep(id); // 动作录制挂点(未录制时零开销)
+    void c.run();
+  }
 }
 
 // tool-letter shortcuts handled by App.vue
 export const TOOL_KEYS: Record<string, string> = {
-  v: 'move', b: 'brush', e: 'eraser', j: 'clone', s: 'clone',
+  v: 'move', b: 'brush', e: 'eraser', j: 'heal', s: 'clone', p: 'pen',
   t: 'type', g: 'gradient', u: 'shape', i: 'eyedropper', m: 'marquee',
-  w: 'wand', l: 'lasso', c: 'crop', h: 'hand', z: 'zoom', r: 'smear',
+  w: 'wand', l: 'lasso', c: 'crop', h: 'hand', z: 'zoom', r: 'smear', o: 'dodge',
 };

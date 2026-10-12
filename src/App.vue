@@ -5,13 +5,23 @@
 
 import { onMounted, onUnmounted } from 'vue';
 import { store, activeLayer, history } from './core/store';
-import { commands, TOOL_KEYS } from './commands';
+import { commands, runCommand, TOOL_KEYS } from './commands';
 import MenuBar from './ui/MenuBar.vue';
 import ToolOptions from './ui/ToolOptions.vue';
 import ToolBar from './ui/ToolBar.vue';
 import CanvasView from './ui/CanvasView.vue';
 import LayersPanel from './ui/LayersPanel.vue';
 import PropertiesPanel from './ui/PropertiesPanel.vue';
+import HistoryPanel from './ui/HistoryPanel.vue';
+import SmartFilterPanel from './ui/SmartFilterPanel.vue';
+import PathsPanel from './ui/PathsPanel.vue';
+import ChannelsPanel from './ui/ChannelsPanel.vue';
+import TimelinePanel from './ui/TimelinePanel.vue';
+import ActionsPanel from './ui/ActionsPanel.vue';
+import CharacterPanel from './ui/CharacterPanel.vue';
+import ParagraphPanel from './ui/ParagraphPanel.vue';
+import LiquifyDialog from './ui/LiquifyDialog.vue';
+import PuppetDialog from './ui/PuppetDialog.vue';
 import StatusBar from './ui/StatusBar.vue';
 import Dialogs from './ui/Dialogs.vue';
 import WelcomeView from './ui/WelcomeView.vue';
@@ -63,7 +73,7 @@ function onKeydown(e: KeyboardEvent) {
     if (matches(sc, e)) {
       if (!cmd.enabled || cmd.enabled()) {
         e.preventDefault();
-        void cmd.run();
+        runCommand(cmd.id); // 统一派发(动作录制挂点)
       }
       return;
     }
@@ -146,10 +156,20 @@ onUnmounted(() => {
         <LayersPanel />
         <div class="right-split"></div>
         <PropertiesPanel />
+        <SmartFilterPanel />
+        <PathsPanel />
+        <ChannelsPanel />
+        <HistoryPanel />
+        <TimelinePanel />
+        <ActionsPanel />
+        <CharacterPanel />
+        <ParagraphPanel />
       </div>
     </div>
     <StatusBar v-if="!store.canvasOnly" />
     <Dialogs />
+    <LiquifyDialog v-if="store.dialog === 'liquify'" />
+    <PuppetDialog v-if="store.dialog === 'puppet'" />
   </div>
 </template>
 
@@ -179,8 +199,27 @@ onUnmounted(() => {
   flex-direction: column;
   min-height: 0;
   border-left: 1px solid #111;
+  /* 面板下限合计超过栏高时出滚动条:顺序 flex 布局盒子虽不重叠,
+     但被压扁面板的内容会溢出到后续面板的盒子里拦截点击(字符/段落
+     面板加入后实测触发),可滚动保证每个面板都能完整滚入视野。 */
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 .right-split { height: 5px; background: #1a1a1a; cursor: row-resize; }
 .right :deep(.layers-panel) { flex: 1.1; min-height: 160px; }
 .right :deep(.props-panel) { flex: 1; min-height: 120px; border-top: 1px solid #111; }
+.right :deep(.history-panel) { flex: 0.75; min-height: 104px; border-top: 1px solid #111; }
+.right :deep(.history-panel.collapsed) { flex: 0 0 auto; min-height: 0; }
+.right :deep(.smartfilter-panel) { flex: 0.7; min-height: 96px; border-top: 1px solid #111; }
+.right :deep(.smartfilter-panel.collapsed) { flex: 0 0 auto; min-height: 0; }
+.right :deep(.paths-panel) { flex: 0.7; min-height: 96px; border-top: 1px solid #111; }
+.right :deep(.paths-panel.collapsed) { flex: 0 0 auto; min-height: 0; }
+.right :deep(.channels-panel) { flex: 0.7; min-height: 96px; border-top: 1px solid #111; }
+.right :deep(.channels-panel.collapsed) { flex: 0 0 auto; min-height: 0; }
+.right :deep(.timeline-panel) { flex: 0.9; min-height: 116px; border-top: 1px solid #111; }
+.right :deep(.timeline-panel.collapsed) { flex: 0 0 auto; min-height: 0; }
+/* 动作面板:折叠时自然高度;展开(v-if 渲染出 .actions-body)时给下限,
+   否则定高栏里它是唯一无下限面板,会被压扁、内容溢出叠到字符/段落面板上。 */
+.right :deep(.actions-panel) { flex: 0 0 auto; min-height: 0; }
+.right :deep(.actions-panel:has(.actions-body)) { flex: 0.7; min-height: 96px; }
 </style>

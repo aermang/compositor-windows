@@ -6,6 +6,7 @@
 import { makeCanvas, ctx2d } from '../../canvasUtils';
 import { parsePsd } from './reader';
 import { blendModeFromKey } from './coder';
+import { iccDescription } from '../icc';
 import { parseAdjustment, skippedAdjustmentLabel } from './adjustments';
 import { parseTextLayer } from './text';
 import { buildShapeDraft, parseSoCo, parseVogk, parseVectorMask, rasterizeSubpaths } from './vector';
@@ -66,13 +67,18 @@ export function readPsd(buf: ArrayBuffer): PsdImportResult {
   }
   if (stack.length > 0) throw new Error('PSD 图层组结构不完整'); // unbalanced divider
 
-  return {
+  const result: PsdImportResult = {
     width: doc.width,
     height: doc.height,
     resolution: doc.resolution,
     layers, // bottom to top
     notes: [...notes],
   };
+  if (doc.iccProfile) {
+    result.iccProfile = doc.iccProfile;
+    result.iccName = iccDescription(doc.iccProfile);
+  }
+  return result;
 }
 
 function displayName(raw: PsdRawLayer): string {

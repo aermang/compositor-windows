@@ -7,6 +7,8 @@
 import { isExoticBlend, pixelBlend } from './blend';
 import { applyAdjustment } from './pixels/adjust';
 import { dilatePlane } from './pixels/morph';
+import { applySmartFilters } from './smartFilter';
+import { refreshSmartBitmap } from './smartObject';
 import {
   makeCanvas, ctx2d, ctx2dRead, drawThroughTransform, cloneCanvas,
 } from './canvasUtils';
@@ -16,8 +18,65 @@ import { cssBlend, rgbToCss } from './types';
 export interface CompositeOpts {
   /** Skip stroke-preview merging (exports) */
   forExport?: boolean;
-  /** Extra canvas drawn atop the active layer's own pixels (live brush stroke). */
-  strokePreview?: { layerId: string; canvas: HTMLCanvasElement } | null;
+  /** Extra canvas drawn atop the active layer's own pixels (live brush stroke);
+   *  `erase` knocks the layer's own pixels out instead (live eraser stroke). */
+  strokePreview?: { layerId: string; canvas: HTMLCanvasElement; erase?: boolean } | null;
+}
+
+// ---------- prepareLayer per-layer cache ----------
+// 缓存「transform + 智能滤镜 + effects 之后、mask/clip 之前」的画布段:mask 与
+// 剪贴蒙版每帧在返回的克隆上现场执行,因此键里不需要任何 mask 相关字段。
+// 失效来源:rev(就地像素编辑走 rasterEdit 等 bump)、bitmapUid(画布身份,
+// undo/redo 换画布自然失效)、transform 全字段(影响缓存段内的绘制)、
+// effects/smartFilters JSON、文档尺寸。opacity/blendMode 在 drawBlended 阶段
+// 生效,不入键。宁可键更严格:任何拿不准的场景都让键更宽,正确性优先。
+
+const bitmapUids = new WeakMap<HTMLCanvasElement, number>();
+let nextBitmapUid = 1;
+
+function bitmapUid(c: HTMLCanvasElement): number {
+  let id = bitmapUids.get(c);
+  if (id === undefined) {
+    id = nextBitmapUid++;
+    bitmapUids.set(c, id);
+  }
+  return id;
+}
+
+interface LayerCacheEntry { key: string; out: HTMLCanvasElement }
+
+const layerCache = new Map<string, LayerCacheEntry>();
+const LAYER_CACHE_CAP = 64;
+
+/** 稳定 JSON:递归按对象键排序后序列化,避免键序不同造成伪失效/漏失效。 */
+function stableJson(v: unknown): string {
+  return JSON.stringify(v, (_k, val: unknown) => {
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      const o = val as Record<string, unknown>;
+      const sorted: Record<string, unknown> = {};
+      for (const k of Object.keys(o).sort()) sorted[k] = o[k];
+      return sorted;
+    }
+    return val;
+  });
+}
+
+function layerCacheKey(doc: Doc, layer: Layer): string {
+  const t = layer.transform;
+  return JSON.stringify([
+    layer.rev ?? 0,
+    bitmapUid(layer.bitmap!),
+    stableJson(layer.effects),
+    stableJson(layer.smartFilters),
+    doc.width, doc.height,
+    t.origin[0], t.origin[1], t.size[0], t.size[1],
+    t.rotation, t.flipX, t.flipY, t.sampling,
+  ]);
+}
+
+/** 仅供测试/基准:清空按层缓存(暴露给 e2e 做性能对照)。 */
+export function resetPrepareLayerCache(): void {
+  layerCache.clear();
 }
 
 /** Render the whole document flat. Returns a doc-size canvas. */
@@ -56,18 +115,54 @@ export function composite(doc: Doc, opts: CompositeOpts = {}): HTMLCanvasElement
   return out;
 }
 
-/** A layer's pixels in document space: transform → effects → mask → clipping. */
+/** A layer's pixels in document space: transform → smart filters → effects → mask → clipping. */
 export function prepareLayer(
   doc: Doc, layer: Layer, prepared: Map<string, HTMLCanvasElement>, opts: CompositeOpts = {},
 ): HTMLCanvasElement | null {
+  if (layer.smartObjectId) refreshSmartBitmap(doc, layer); // 智能层:物化视图按需重建(rev 短路)
   if (!layer.bitmap) return null;
+
+  // stroke-preview 层每帧都在变;调整层没有位图,根本走不到这里
+  const cacheable = opts.strokePreview?.layerId !== layer.id;
+  const key = cacheable ? layerCacheKey(doc, layer) : null;
+  if (key) {
+    const hit = layerCache.get(layer.id);
+    if (hit && hit.key === key) {
+      // LRU touch:delete + set 把条目挪到尾部(最近使用)
+      layerCache.delete(layer.id);
+      layerCache.set(layer.id, hit);
+      // 返回克隆:mask/clip 阶段以及部分调用方会在返回值上就地改写
+      return cloneCanvas(hit.out);
+    }
+  }
+
   const c = makeCanvas(doc.width, doc.height);
   const cx = ctx2d(c);
   drawThroughTransform(cx, layer.bitmap, layer.bitmap.width, layer.bitmap.height, layer.transform);
 
-  // live brush stroke on this layer (a layer-local canvas like the bitmap)
+  // live brush stroke on this layer (a layer-local canvas like the bitmap);
+  // erase strokes knock the layer's own pixels out so the preview matches the commit
   if (opts.strokePreview?.layerId === layer.id) {
-    drawThroughTransform(cx, opts.strokePreview.canvas, opts.strokePreview.canvas.width, opts.strokePreview.canvas.height, layer.transform);
+    const prev = opts.strokePreview;
+    if (prev.erase) {
+      cx.save();
+      cx.globalCompositeOperation = 'destination-out';
+      drawThroughTransform(cx, prev.canvas, prev.canvas.width, prev.canvas.height, layer.transform);
+      cx.restore();
+    } else {
+      drawThroughTransform(cx, prev.canvas, prev.canvas.width, prev.canvas.height, layer.transform);
+    }
+  }
+
+  // 智能滤镜:transform 之后、effects 之前(图层样式采样的是滤镜后的像素);
+  // 空栈/全禁用时 applySmartFilters 零拷贝返回 src,避免每帧多余的画布分配
+  const activeFilters = layer.smartFilters?.filter(f => !!f && f.enabled) ?? [];
+  if (activeFilters.length) {
+    const filtered = applySmartFilters(c, activeFilters);
+    if (filtered !== c) {
+      cx.clearRect(0, 0, c.width, c.height);
+      cx.drawImage(filtered, 0, 0);
+    }
   }
 
   let content = c;
@@ -75,6 +170,15 @@ export function prepareLayer(
   if (content !== c) {
     cx.clearRect(0, 0, c.width, c.height);
     cx.drawImage(content, 0, 0);
+  }
+
+  // 存缓存段(mask 之前)。必须存副本:c 之后会被 mask/clip 就地改写
+  if (key) {
+    if (layerCache.size >= LAYER_CACHE_CAP) {
+      const oldest = layerCache.keys().next().value;
+      if (oldest !== undefined) layerCache.delete(oldest);
+    }
+    layerCache.set(layer.id, { key, out: cloneCanvas(c) });
   }
 
   if (layer.mask && layer.maskEnabled) {
@@ -392,70 +496,4 @@ function strokeCanvas(
   return t;
 }
 
-// ---------- Text rendering (bitmap fallback for text layers) ----------
-
-export function renderTextBitmap(
-  width: number, height: number, text: {
-    content: string; fontName: string; fontSize: number; color: [number, number, number];
-    align: 'left' | 'center' | 'right'; tracking: number; lineSpacing: number;
-    boxSize: [number, number] | null;
-  },
-): HTMLCanvasElement {
-  const c = makeCanvas(Math.max(1, width), Math.max(1, height));
-  const cx = ctx2d(c);
-  cx.font = `${text.fontSize}px ${cssFontFamily(text.fontName)}`;
-  cx.textBaseline = 'top';
-  cx.fillStyle = rgbToCss(text.color);
-  const wrapWidth = text.boxSize ? text.boxSize[0] : width;
-  const lines = wrapText(cx, text.content, wrapWidth, text.tracking);
-  lines.forEach((line, i) => {
-    const lw = measuredWidth(cx, line, text.tracking);
-    const x = text.align === 'center' ? (wrapWidth - lw) / 2
-      : text.align === 'right' ? (wrapWidth - lw) : 0;
-    drawTracked(cx, line, x, i * text.lineSpacing, text.tracking);
-  });
-  return c;
-}
-
-function cssFontFamily(postScriptName: string): string {
-  // PostScript names like "Helvetica-Bold" → CSS family with weight heuristic
-  const m = postScriptName.match(/^(.*?)-(Regular|Bold|Italic|BoldItalic|Light|Semibold|Medium)$/);
-  if (!m) return `"${postScriptName}", system-ui, sans-serif`;
-  const map: Record<string, string> = {
-    Regular: '', Bold: 'bold', Italic: 'italic', BoldItalic: 'bold italic',
-    Light: '300', Semibold: '600', Medium: '500',
-  };
-  return `${map[m[2]] || ''} "${m[1]}", system-ui, sans-serif`.trim();
-}
-
-function wrapText(cx: CanvasRenderingContext2D, content: string, maxWidth: number, tracking: number): string[] {
-  const out: string[] = [];
-  for (const para of content.split('\n')) {
-    const words = para.split(' ');
-    let line = '';
-    for (const word of words) {
-      const test = line ? line + ' ' + word : word;
-      if (measuredWidth(cx, test, tracking) > maxWidth && line) {
-        out.push(line);
-        line = word;
-      } else {
-        line = test;
-      }
-    }
-    out.push(line);
-  }
-  return out;
-}
-
-function measuredWidth(cx: CanvasRenderingContext2D, text: string, tracking: number): number {
-  return cx.measureText(text).width + tracking * Math.max(0, text.length - 1);
-}
-
-function drawTracked(cx: CanvasRenderingContext2D, text: string, x: number, y: number, tracking: number) {
-  if (!tracking) { cx.fillText(text, x, y); return; }
-  let cur = x;
-  for (const ch of text) {
-    cx.fillText(ch, cur, y);
-    cur += cx.measureText(ch).width + tracking;
-  }
-}
+// 文本位图渲染已迁至 textRender.ts(活字排版智能体独占;store.upsertTextBitmap 调用)。

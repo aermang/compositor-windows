@@ -5,12 +5,14 @@
 
 import { ref, computed, reactive, watch } from 'vue';
 import { store, newDoc, activeLayer, history, flattenDoc } from '../core/store';
-import { commands, applyFilterToActive, openPathByKind } from '../commands';
+import { commands, runCommand, applyFilterToActive, openPathByKind } from '../commands';
 import { featherSelection, growSelection } from '../core/selection';
 import { makeCanvas, ctx2d, clamp } from '../core/canvasUtils';
 import { defaultEffects } from '../core/types';
 import type { EffectsData, Layer } from '../core/types';
 import { exportCanvas } from '../core/io/raster';
+import { exportPsd } from '../core/io/psdExport';
+import { writeFile } from '../core/io/fs';
 import { EFFECT_ZH } from '../core/labels';
 import { getRecents, removeRecent } from '../core/recent';
 import type { RecentEntry } from '../core/recent';
@@ -47,7 +49,7 @@ const PRESETS = [
 
 // ---------- Export ----------
 
-const exportState = reactive({ format: 'png', quality: 0.92, scale: 1, path: '' });
+const exportState = reactive({ format: 'png', quality: 0.92, scale: 1, path: '', bitDepth: 8 as 8 | 16 });
 
 async function chooseExportPath() {
   const { save } = await import('@tauri-apps/plugin-dialog');
@@ -58,6 +60,15 @@ async function chooseExportPath() {
 
 async function doExport() {
   if (!store.doc || !exportState.path) return;
+  if (exportState.format === 'psd') {
+    // PSD 保留图层:按文档原尺寸导出,忽略缩放;位深写入文档口径(exportPsd 读它)
+    const path = exportState.path.toLowerCase().endsWith('.psd')
+      ? exportState.path : exportState.path + '.psd';
+    store.doc.bitDepth = exportState.bitDepth;
+    await writeFile(path, new Uint8Array(exportPsd(store.doc)));
+    close();
+    return;
+  }
   const flat = flattenDoc();
   const s = exportState.scale;
   let out = flat;
@@ -84,6 +95,14 @@ async function doExport() {
 // ---------- Image Size / Canvas Size ----------
 
 const sizeState = reactive({ width: 0, height: 0, link: true });
+
+// ---------- Image Info ----------
+
+// 位深是来源/导出口径标志(TIFF/PSD 导出与 .comp 走它),非内部合成精度(恒 8bit)。
+const infoDepth = computed({
+  get: () => store.doc?.bitDepth ?? 8,
+  set: v => { if (store.doc) { store.doc.bitDepth = v; store.dirty = true; } },
+});
 watch(dialog, d => {
   if (!store.doc) return;
   if (d === 'imageSize' || d === 'canvasSize') {
@@ -196,6 +215,29 @@ const FILTER_PARAMS: Record<string, FilterDef[]> = {
     { key: 'radius', label: '半径', min: 1, max: 60, step: 1, unit: 'px' },
   ],
   sharpen: [{ key: 'amount', label: '数量', min: 0, max: 200, step: 1, unit: '%' }],
+  vibrance: [
+    { key: 'vibrance', label: '自然饱和度', min: 0, max: 100, step: 1, unit: '%' },
+    { key: 'saturation', label: '饱和度', min: -100, max: 100, step: 1, unit: '%' },
+  ],
+  channelMixer: [
+    { key: 'redFromRed', label: '红-红', min: -200, max: 200, step: 1, unit: '%' },
+    { key: 'redFromGreen', label: '红-绿', min: -200, max: 200, step: 1, unit: '%' },
+    { key: 'redFromBlue', label: '红-蓝', min: -200, max: 200, step: 1, unit: '%' },
+    { key: 'greenFromRed', label: '绿-红', min: -200, max: 200, step: 1, unit: '%' },
+    { key: 'greenFromGreen', label: '绿-绿', min: -200, max: 200, step: 1, unit: '%' },
+    { key: 'greenFromBlue', label: '绿-蓝', min: -200, max: 200, step: 1, unit: '%' },
+    { key: 'blueFromRed', label: '蓝-红', min: -200, max: 200, step: 1, unit: '%' },
+    { key: 'blueFromGreen', label: '蓝-绿', min: -200, max: 200, step: 1, unit: '%' },
+    { key: 'blueFromBlue', label: '蓝-蓝', min: -200, max: 200, step: 1, unit: '%' },
+  ],
+  photoFilter: [
+    { key: 'warmth', label: '色温(冷→暖)', min: -100, max: 100, step: 1, unit: '' },
+    { key: 'density', label: '浓度', min: 0, max: 100, step: 1, unit: '%' },
+  ],
+  shadowHighlight: [
+    { key: 'shadows', label: '阴影量', min: 0, max: 100, step: 1, unit: '%' },
+    { key: 'highlights', label: '高光量', min: 0, max: 100, step: 1, unit: '%' },
+  ],
 };
 // key stays the canonical English param name (drives filterState.params);
 // label is the Chinese display text.
@@ -285,7 +327,7 @@ function runSearch(i: number) {
   if (!c) return;
   close();
   searchQuery.value = '';
-  if (!c.enabled || c.enabled()) void c.run();
+  if (!c.enabled || c.enabled()) runCommand(c.id); // 统一派发(动作录制挂点)
 }
 
 function onDialogKey(e: KeyboardEvent) {
@@ -387,12 +429,19 @@ const SHORTCUT_GROUPS: { title: string; pairs: [string, string][] }[] = [
           <option value="png">PNG</option>
           <option value="jpeg">JPEG</option>
           <option value="webp">WebP</option>
+          <option value="psd">PSD（含图层）</option>
         </select>
-        <label class="field">缩放
+        <label v-if="exportState.format !== 'psd'" class="field">缩放
           <input type="number" min="0.05" max="8" step="0.05" v-model.number="exportState.scale" />
         </label>
+        <label v-if="exportState.format === 'psd'" class="field">位深
+          <select class="select" v-model.number="exportState.bitDepth">
+            <option :value="8">8 位/通道</option>
+            <option :value="16">16 位/通道</option>
+          </select>
+        </label>
       </div>
-      <label v-if="exportState.format !== 'png'" class="row">质量
+      <label v-if="exportState.format !== 'png' && exportState.format !== 'psd'" class="row">质量
         <input type="range" min="0.3" max="1" step="0.01" v-model.number="exportState.quality" />
         <span class="v">{{ Math.round(exportState.quality * 100) }}%</span>
       </label>
@@ -441,6 +490,26 @@ const SHORTCUT_GROUPS: { title: string; pairs: [string, string][] }[] = [
       <div class="actions">
         <button class="btn" @click="close">取消</button>
         <button class="btn primary" @click="applyCanvasSize">调整大小</button>
+      </div>
+    </div>
+
+    <!-- Image Info -->
+    <div v-if="dialog === 'imageInfo' && store.doc" class="dialog" @keydown="onDialogKey">
+      <h3>图像信息</h3>
+      <div class="hint">
+        <div>尺寸:{{ store.doc.width }} × {{ store.doc.height }} px</div>
+        <div>分辨率:{{ store.doc.resolution }} dpi</div>
+        <div>图层:{{ store.doc.layers.length }}</div>
+        <div>ICC:{{ store.doc.iccName ?? 'sRGB(未嵌入)' }}</div>
+      </div>
+      <label class="field">位深(来源/导出口径,TIFF/PSD 导出生效)
+        <select class="select" v-model.number="infoDepth">
+          <option :value="8">8 位/通道</option>
+          <option :value="16">16 位/通道</option>
+        </select>
+      </label>
+      <div class="actions">
+        <button class="btn primary" @click="close">关闭</button>
       </div>
     </div>
 

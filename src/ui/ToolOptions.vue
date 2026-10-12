@@ -33,10 +33,91 @@ const FONTS = ['Segoe UI', 'Arial', 'Times New Roman', 'Georgia', 'Courier New',
     <template v-else-if="store.tool === 'lasso'">
       <span class="lbl">套索</span>
       <div class="seg">
-        <button :class="{ on: !store.opts.lasso.polygonal }" @click="store.opts.lasso.polygonal = false">自由套索</button>
-        <button :class="{ on: store.opts.lasso.polygonal }" @click="store.opts.lasso.polygonal = true">多边形套索</button>
+        <button :class="{ on: !store.opts.lasso.polygonal && !store.opts.lasso.magnetic }" @click="store.opts.lasso.polygonal = false; store.opts.lasso.magnetic = false">自由套索</button>
+        <button :class="{ on: store.opts.lasso.polygonal }" @click="store.opts.lasso.polygonal = true; store.opts.lasso.magnetic = false">多边形套索</button>
+        <button :class="{ on: store.opts.lasso.magnetic }" @click="store.opts.lasso.magnetic = true; store.opts.lasso.polygonal = false">磁性套索</button>
       </div>
-      <span class="hint">多边形：单击加点，Enter 闭合，Esc 取消</span>
+      <template v-if="store.opts.lasso.magnetic">
+        <label class="field">宽度
+          <input type="range" min="2" max="40" v-model.number="store.opts.lasso.width" />
+          <span class="val">{{ store.opts.lasso.width }} px</span>
+        </label>
+        <label class="field">对比度
+          <input type="range" min="5" max="90" v-model.number="store.opts.lasso.contrast" />
+          <span class="val">{{ store.opts.lasso.contrast }}%</span>
+        </label>
+        <label class="field">频率
+          <input type="range" min="10" max="80" v-model.number="store.opts.lasso.frequency" />
+          <span class="val">{{ store.opts.lasso.frequency }}</span>
+        </label>
+      </template>
+      <span v-else class="hint">多边形：单击加点，Enter 闭合，Esc 取消</span>
+      <span v-if="store.opts.lasso.magnetic" class="hint">磁性：沿边缘自动吸附 · 单击手动加点 · Enter/Esc 结束</span>
+    </template>
+
+    <!-- Pen -->
+    <template v-else-if="store.tool === 'pen'">
+      <span class="lbl">钢笔</span>
+      <span class="hint">单击加角点 · 拖动出曲线手柄 · Alt 拖断手柄 · 单击首点/双击/Enter 闭合 · Esc 取消 · 路径面板描边/填充/转选区</span>
+    </template>
+
+    <!-- Heal -->
+    <template v-else-if="store.tool === 'heal'">
+      <span class="lbl">修复画笔</span>
+      <div class="seg">
+        <button :class="{ on: store.opts.heal.mode === 'spot' }" @click="store.opts.heal.mode = 'spot'">污点修复</button>
+        <button :class="{ on: store.opts.heal.mode === 'heal' }" @click="store.opts.heal.mode = 'heal'">修复画笔</button>
+      </div>
+      <label class="field">大小
+        <input type="range" min="4" max="200" v-model.number="store.opts.heal.size" />
+        <span class="val">{{ store.opts.heal.size }} px</span>
+      </label>
+      <label class="field">硬度
+        <input type="range" min="0" max="0.95" step="0.05" v-model.number="store.opts.heal.hardness" />
+        <span class="val">{{ Math.round(store.opts.heal.hardness * 100) }}%</span>
+      </label>
+      <span class="hint">污点修复：涂抹污点自动取样 · 修复画笔：Alt 单击设源</span>
+    </template>
+
+    <!-- Dodge / Burn / Sponge -->
+    <template v-else-if="store.tool === 'dodge'">
+      <span class="lbl">减淡</span>
+      <div class="seg">
+        <button :class="{ on: store.opts.dodge.mode === 'dodge' }" @click="store.opts.dodge.mode = 'dodge'">减淡</button>
+        <button :class="{ on: store.opts.dodge.mode === 'burn' }" @click="store.opts.dodge.mode = 'burn'">加深</button>
+        <button :class="{ on: store.opts.dodge.mode === 'sponge' }" @click="store.opts.dodge.mode = 'sponge'">海绵</button>
+      </div>
+      <label class="field">大小
+        <input type="range" min="4" max="400" v-model.number="store.opts.dodge.size" />
+        <span class="val">{{ store.opts.dodge.size }} px</span>
+      </label>
+      <label v-if="store.opts.dodge.mode !== 'sponge'" class="field">曝光度
+        <input type="range" min="1" max="100" v-model.number="store.opts.dodge.exposure" />
+        <span class="val">{{ store.opts.dodge.exposure }}%</span>
+      </label>
+      <template v-else>
+        <label class="field">流量
+          <input type="range" min="5" max="100" v-model.number="store.opts.dodge.spongeFlow" />
+          <span class="val">{{ store.opts.dodge.spongeFlow }}%</span>
+        </label>
+        <div class="seg">
+          <button :class="{ on: store.opts.dodge.spongeMode === 'saturate' }" @click="store.opts.dodge.spongeMode = 'saturate'">加饱和</button>
+          <button :class="{ on: store.opts.dodge.spongeMode === 'desaturate' }" @click="store.opts.dodge.spongeMode = 'desaturate'">去饱和</button>
+        </div>
+      </template>
+      <span class="hint">直接作用于图层像素 · 每笔一条历史</span>
+    </template>
+
+    <!-- Patch -->
+    <template v-else-if="store.tool === 'patch'">
+      <span class="lbl">修补</span>
+      <span class="hint">拖出要修补的区域 → 再拖到取样区松开 · 内容自适应填充 + 边缘羽化</span>
+    </template>
+
+    <!-- Content-Aware Move -->
+    <template v-else-if="store.tool === 'camove'">
+      <span class="lbl">感知移动</span>
+      <span class="hint">拖出要移动的区域 → 再拖到目标位置松开 · 移动原区+智能填充空洞</span>
     </template>
 
     <!-- Wand -->
@@ -89,6 +170,7 @@ const FONTS = ['Segoe UI', 'Arial', 'Times New Roman', 'Georgia', 'Courier New',
         <input type="range" min="0.05" max="1" step="0.05" v-model.number="brushTarget.opacity" />
         <span class="val">{{ Math.round(brushTarget.opacity * 100) }}%</span>
       </label>
+      <label class="check"><input type="checkbox" v-model="uiFlags.penPressure" /> 压感</label>
       <template v-if="activeLayer?.mask">
         <div class="seg">
           <button :class="{ on: store.paintingTarget === 'image' }" @click="store.paintingTarget = 'image'">图像</button>
@@ -109,6 +191,7 @@ const FONTS = ['Segoe UI', 'Arial', 'Times New Roman', 'Georgia', 'Courier New',
         <span class="val">{{ Math.round(store.opts.clone.hardness * 100) }}%</span>
       </label>
       <label class="check"><input type="checkbox" v-model="store.opts.clone.aligned" /> 对齐</label>
+      <label class="check"><input type="checkbox" v-model="uiFlags.penPressure" /> 压感</label>
       <span class="hint">Alt 单击设置源</span>
     </template>
 
@@ -147,6 +230,9 @@ const FONTS = ['Segoe UI', 'Arial', 'Times New Roman', 'Georgia', 'Courier New',
       <div class="seg">
         <button :class="{ on: store.opts.gradient.type === 'linear' }" @click="store.opts.gradient.type = 'linear'">线性</button>
         <button :class="{ on: store.opts.gradient.type === 'radial' }" @click="store.opts.gradient.type = 'radial'">径向</button>
+        <button :class="{ on: store.opts.gradient.type === 'angle' }" @click="store.opts.gradient.type = 'angle'">角度</button>
+        <button :class="{ on: store.opts.gradient.type === 'reflected' }" @click="store.opts.gradient.type = 'reflected'">对称</button>
+        <button :class="{ on: store.opts.gradient.type === 'diamond' }" @click="store.opts.gradient.type = 'diamond'">菱形</button>
       </div>
       <div class="seg">
         <button :class="{ on: store.opts.gradient.mode === 'fg-bg' }" @click="store.opts.gradient.mode = 'fg-bg'">前景→背景</button>
@@ -162,7 +248,12 @@ const FONTS = ['Segoe UI', 'Arial', 'Times New Roman', 'Georgia', 'Courier New',
         <option value="roundedRectangle">圆角矩形</option>
         <option value="ellipse">椭圆</option>
         <option value="line">线条</option>
+        <option value="polygon">多边形</option>
       </select>
+      <label v-if="store.opts.shape.kind === 'polygon'" class="field">边数
+        <input type="range" min="3" max="12" v-model.number="store.opts.shape.sides" />
+        <span class="val">{{ store.opts.shape.sides }}</span>
+      </label>
       <label v-if="store.opts.shape.kind === 'roundedRectangle'" class="field">圆角
         <input type="range" min="0" max="100" v-model.number="store.opts.shape.cornerRadius" />
         <span class="val">{{ store.opts.shape.cornerRadius }}</span>

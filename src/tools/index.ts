@@ -34,9 +34,15 @@ import { marqueeTool, lassoTool, wandTool } from './select';
 import { brushTool, eraserTool, cloneTool } from './paint';
 import { cropTool } from './crop';
 import { shapeTool, gradientTool, textTool, eyedropperTool } from './create';
+import { penTool } from './pen';
+import { healTool } from './heal';
+import { dodgeTool } from './dodge';
+import { patchTool } from './patch';
+import { camoveTool } from './camove';
 
 [moveTool, marqueeTool, lassoTool, wandTool, brushTool, eraserTool, cloneTool,
-  cropTool, shapeTool, gradientTool, textTool, eyedropperTool].forEach(register);
+  cropTool, shapeTool, gradientTool, textTool, eyedropperTool, penTool, healTool,
+  dodgeTool, patchTool, camoveTool].forEach(register);
 
 export function toolFor(id: ToolId): Tool | null {
   return tools[id] ?? null;

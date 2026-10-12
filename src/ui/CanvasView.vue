@@ -10,7 +10,7 @@
 import { onMounted, onUnmounted, ref, watch, computed } from 'vue';
 import {
   store, setZoom, fitToScreen, screenToDoc, activeLayer, invalidate, history,
-  addRasterLayer, newDoc, rawCanvas, setDoc, rasterEdit,
+  addRasterLayer, newDoc, rawCanvas, setDoc, rasterEdit, bumpLayerRev,
 } from '../core/store';
 import { composite } from '../core/compositor';
 import {
@@ -19,6 +19,8 @@ import {
 import { toolFor } from '../tools';
 import { lassoKey } from '../tools/select';
 import { cropKey } from '../tools/crop';
+import { drawRegisteredOverlays } from '../core/overlayRegistry';
+import { routeToolKey } from '../core/toolKeys';
 import { WarpStroke, type WarpParams } from '../tools/warp';
 import { BlurBrushSource, blurSigma } from '../tools/blurBrush';
 import { isRawPath, developRaw, rawMetadata } from '../core/io/raw';
@@ -116,6 +118,15 @@ function draw() {
   const doc = store.doc;
   const z = store.zoom;
 
+  // document shadow first, so the opaque shadow fill sits UNDER the
+  // checkerboard instead of hiding it (transparent areas must read as checker)
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.5)';
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(store.panX, store.panY, doc.width * z, doc.height * z);
+  ctx.restore();
+
   // checkerboard anchored to the document's top-left, 10 screen px squares scaled by zoom
   const sq = Math.max(4, 10 * Math.max(1, z));
   const ox = store.panX % (sq * 2), oy = store.panY % (sq * 2);
@@ -130,14 +141,6 @@ function draw() {
       ctx.fillRect(x, y, sq, sq);
     }
   }
-  ctx.restore();
-
-  // document shadow + edge
-  ctx.save();
-  ctx.shadowColor = 'rgba(0,0,0,0.5)';
-  ctx.shadowBlur = 12;
-  ctx.fillStyle = '#000';
-  ctx.fillRect(store.panX, store.panY, doc.width * z, doc.height * z);
   ctx.restore();
 
   // the composite; crisp (nearest) at zoom ≥ 2, as the macOS app does
@@ -156,6 +159,7 @@ function draw() {
 
   drawSelectionAnts(ctx, z);
   drawToolOverlays(ctx, z);
+  drawRegisteredOverlays(ctx, z, dx => store.panX + dx * z, dy => store.panY + dy * z);
   drawTransformBox(ctx, z);
 }
 
@@ -229,6 +233,17 @@ function drawToolOverlays(ctx: CanvasRenderingContext2D, z: number) {
     ctx.beginPath();
     if ((p.shape === 'ellipse') || (p.kind === 'shape' && p.shape === 'ellipse')) {
       ctx.ellipse(X(x + w / 2), Y(y + h / 2), w * z / 2, h * z / 2, 0, 0, Math.PI * 2);
+    } else if (p.kind === 'shape' && p.shape === 'polygon') {
+      const sides = Math.max(3, Number(p.sides) || 5);
+      // 落图是内接正多边形(半径 min(w,h)/2),预览必须同款,非正方形拖拽才不会不一致
+      const r = Math.min(w, h) * z / 2;
+      for (let i = 0; i < sides; i++) {
+        const a = -Math.PI / 2 + (i * 2 * Math.PI) / sides;
+        const px = X(x + w / 2) + Math.cos(a) * r;
+        const py = Y(y + h / 2) + Math.sin(a) * r;
+        if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py);
+      }
+      ctx.closePath();
     } else {
       ctx.rect(X(x), Y(y), w * z, h * z);
     }
@@ -311,14 +326,15 @@ function redrawOverlay() {
 
 function paintToolActive(): boolean {
   return store.tool === 'brush' || store.tool === 'eraser' || store.tool === 'clone'
-    || store.tool === 'smear';
+    || store.tool === 'smear' || store.tool === 'heal';
 }
 
 function drawBrushCursor(ctx: CanvasRenderingContext2D) {
   if (!paintToolActive() || !hoverPt) return;
   const size = (store.tool === 'clone' ? store.opts.clone.size
     : store.tool === 'smear' ? store.opts.smear.diameter
-      : store.opts.brush.size) * store.zoom;
+      : store.tool === 'heal' ? store.opts.heal.size
+        : store.opts.brush.size) * store.zoom;
   const r = Math.max(2, size / 2);
   ctx.save();
   // double stroke: white 2.5 then black 1
@@ -811,13 +827,19 @@ function dragSmear(te: ToolEvent): void {
   store.tick++;
 }
 
-/** Paint `source` into the layer mask with a before/after ImageData history entry. */
-function commitMaskEdit(layer: Layer, label: string, source: HTMLCanvasElement): void {
+/** Paint `source` into the layer mask with a before/after ImageData history entry.
+ *  `replace` clears the mask first: a warp/smudge result is the complete new
+ *  image, and source-over would let the pristine mask bleed through every spot
+ *  the warp eroded to partial alpha (healing the stroke back to nothing). */
+function commitMaskEdit(layer: Layer, label: string, source: HTMLCanvasElement, replace = false): void {
   const m = layer.mask;
   if (!m) return;
   const before = ctx2dRead(m).getImageData(0, 0, m.width, m.height);
-  ctx2d(m).drawImage(source, 0, 0);
+  const c = ctx2d(m);
+  if (replace) c.clearRect(0, 0, m.width, m.height);
+  c.drawImage(source, 0, 0);
   const after = ctx2dRead(m).getImageData(0, 0, m.width, m.height);
+  bumpLayerRev(layer); // in-place mask edit: keep the compositor's layer cache honest
   const restore = (data: ImageData) => () => {
     if (layer.mask) ctx2dRead(layer.mask).putImageData(data, 0, 0);
     store.tick++;
@@ -840,10 +862,17 @@ function finishSmearStroke(): void {
     else layer.mask = s.pristine;
     if (!s.painted) { store.tick++; return; }
     if (s.target === 'mask') {
-      commitMaskEdit(layer, '涂抹', result);
+      commitMaskEdit(layer, '涂抹', result, true);
       return;
     }
-    rasterEdit(layer, '涂抹', bmp => { ctx2d(bmp).drawImage(result, 0, 0); });
+    // Replace, not source-over: the warp result is the complete new image.
+    // Blending it over the pristine lets the old opaque pixels bleed through
+    // every semi-transparent erosion the liquify just made, healing the stroke.
+    rasterEdit(layer, '涂抹', bmp => {
+      const c = ctx2d(bmp);
+      c.clearRect(0, 0, bmp.width, bmp.height);
+      c.drawImage(result, 0, 0);
+    });
     return;
   }
 
@@ -1015,6 +1044,7 @@ function onDoubleClick(e: MouseEvent) {
   const te = toToolEvent(e as unknown as PointerEvent);
   const hit = hitTextLayer(te.doc);
   if (hit) {
+    store.doc.activeLayerId = hit.id; // editing also selects: handles/tools now target the text layer
     uiFlags.editingTextLayerId = hit.id;
     store.editingTextId = hit.id;
     return;
@@ -1040,6 +1070,7 @@ function onKeyDown(e: KeyboardEvent) {
   if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement
     || (e.target as HTMLElement | null)?.isContentEditable) return;
   if (lassoKey(e) || cropKey(e)) return;
+  if (routeToolKey(e)) return;
   if (e.key === 'Escape') {
     // a floating selection cancels first — ahead of transform-gesture revert etc.
     if (floating.active && !editingId.value) {

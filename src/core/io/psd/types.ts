@@ -42,6 +42,7 @@ export interface PsdDocument {
   isPsb: boolean;
   layers: PsdRawLayer[];
   notes: string[];    // parser-level notes (e.g. ZIP channels), merged into the result
+  iccProfile?: Uint8Array; // Image Resource ID 1039(ICC profile 原始字节,原样保留)
 }
 
 /** Live text reconstruction draft from a TySh/tySh block. */
@@ -91,4 +92,6 @@ export interface PsdImportResult {
   resolution: number;
   layers: PsdLayerRecord[]; // bottom to top
   notes: string[];
+  iccProfile?: Uint8Array;  // 资源 ID 1039 原始字节(供上层回填 Doc.iccProfile)
+  iccName?: string;         // profile 描述名(desc 标签),如 'sRGB IEC61966-2.1'
 }

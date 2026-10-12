@@ -134,6 +134,13 @@ function onKeydown(e: KeyboardEvent) {
 }
 
 function onBlur() {
+  // Chrome/WebView2 can drop focus to <body> right after the initial focus when
+  // selection ranges are (re)applied under an in-flight pointer gesture — that
+  // premature blur must not commit. Re-focus during the grace window instead.
+  if (!finished && performance.now() - mountedAt < 400) {
+    root.value?.focus();
+    return;
+  }
   commit();
 }
 
@@ -150,29 +157,29 @@ function onDocPointerDown(e: PointerEvent) {
 
 watch(layer, l => { if (!l) finish(); });
 
+let mountedAt = 0;
+
 onMounted(async () => {
   const l = layer.value;
   if (!l?.text) { finish(); return; }
   originalContent = l.text.content;
   wasVisible = l.isVisible;
+  mountedAt = performance.now();
   // hide the layer's own render; the live caret text replaces it
   l.isVisible = false;
   invalidate();
   const el = root.value!;
   el.textContent = originalContent;
   await nextTick();
-  el.focus();
+  // selection first, focus last: focusing after range mutations avoids the
+  // Chromium quirk where removeAllRanges() silently blurs the contenteditable
   const sel = window.getSelection();
   const range = document.createRange();
   range.selectNodeContents(el);
-  if (originalContent === 'Text') {
-    sel?.removeAllRanges();
-    sel?.addRange(range);            // placeholder: select all, first typing replaces
-  } else {
-    range.collapse(false);           // caret at end
-    sel?.removeAllRanges();
-    sel?.addRange(range);
-  }
+  if (originalContent !== 'Text') range.collapse(false); // caret at end; placeholder stays select-all
+  sel?.removeAllRanges();
+  sel?.addRange(range);
+  el.focus();
   document.addEventListener('pointerdown', onDocPointerDown, true);
 });
 

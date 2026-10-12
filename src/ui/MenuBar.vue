@@ -4,7 +4,7 @@
 import { ref, computed } from 'vue';
 import { store } from '../core/store';
 import { MENU_ZH } from '../core/labels';
-import { commands } from '../commands';
+import { commands, runCommand } from '../commands';
 import type { Command } from '../commands';
 
 const open = ref<string | null>(null);
@@ -29,7 +29,7 @@ function enabled(c: Command): boolean {
 
 function run(c: Command) {
   open.value = null;
-  if (enabled(c)) void c.run();
+  if (enabled(c)) runCommand(c.id); // 走统一派发:快捷键/命令面板/动作录制共用一套 enabled+录制钩子
 }
 
 function docTitle(): string {
